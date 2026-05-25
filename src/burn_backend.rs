@@ -1107,28 +1107,11 @@ fn burn_permute<B: Backend>(input: BurnTensor<B>, layer: &NcnnLayer) -> Result<B
             let new_w = input.h;
             let new_h = input.w;
             let c = input.c;
-            let mut rows = Vec::with_capacity(new_h);
-            for x in 0..input.w {
-                let index = Tensor::<B, 1, Int>::from_data(
-                    TensorData::new(vec![x as i64], [1]),
-                    &input.tensor.device(),
-                );
-                rows.push(
-                    input
-                        .tensor
-                        .clone()
-                        .select(3, index)
-                        .reshape([1, c, 1, new_w]),
-                );
-            }
             Ok(BurnTensor {
                 w: new_w,
                 h: new_h,
                 c,
-                // Materialize the transpose instead of returning a strided view.
-                // WGPU/Metal can otherwise read back the physical buffer order and
-                // produce valid-looking tensors with all confidence scores misplaced.
-                tensor: Tensor::cat(rows, 2),
+                tensor: input.tensor.swap_dims(2, 3),
             })
         }
         _ => Err(AmbarError::InvalidNcnnShape {

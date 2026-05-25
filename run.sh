@@ -3,7 +3,7 @@ set -euo pipefail
 
 IMAGE=${IMAGE:-dog_bike_man.jpg}
 MODEL=${MODEL:-nano}
-BACKEND=${BACKEND:-flex}
+BACKEND=${BACKEND:-wgpu}
 RUNS=${RUNS:-20}
 OUTPUT=${OUTPUT:-output.jpg}
 CSV=${CSV:-burn_flex.csv}
