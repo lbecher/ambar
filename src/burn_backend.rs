@@ -178,6 +178,7 @@ pub struct BurnNcnnBackend<B: Backend> {
     pub(crate) execution_plan: NcnnExecutionPlan,
     pub(crate) focus_indices: Option<BurnFocusIndices<B>>,
     pub(crate) max_candidates_before_nms: usize,
+    pub(crate) materialize_layout_ops: bool,
     pub(crate) device: B::Device,
 }
 
@@ -188,6 +189,7 @@ impl<B: Backend> BurnNcnnBackend<B> {
         device: B::Device,
         input_size: usize,
         max_candidates_before_nms: usize,
+        materialize_layout_ops: bool,
     ) -> Result<Self> {
         let model = NcnnModel::from_files(param_path, bin_path)?;
         let cpu_weights = decode_model_weights(&model)?;
@@ -205,6 +207,7 @@ impl<B: Backend> BurnNcnnBackend<B> {
             execution_plan,
             focus_indices,
             max_candidates_before_nms,
+            materialize_layout_ops,
             device,
         })
     }
@@ -217,6 +220,7 @@ impl<B: Backend> InferenceBackend for BurnNcnnBackend<B> {
             &self.decoded_weights,
             &self.execution_plan,
             self.focus_indices.as_ref(),
+            self.materialize_layout_ops,
             &self.device,
             input,
         )?;
@@ -238,6 +242,7 @@ impl<B: Backend + VisionBackend> BurnVisionNcnnBackend<B> {
         input_size: usize,
         strides: &[u32],
         max_candidates_before_nms: usize,
+        materialize_layout_ops: bool,
     ) -> Result<Self> {
         let inner = BurnNcnnBackend::<B>::from_files(
             param_path,
@@ -245,6 +250,7 @@ impl<B: Backend + VisionBackend> BurnVisionNcnnBackend<B> {
             device.clone(),
             input_size,
             max_candidates_before_nms,
+            materialize_layout_ops,
         )?;
         let decode_grids = BurnDecodeGrids::new(input_size as u32, strides, &device);
         Ok(Self {
@@ -273,6 +279,7 @@ impl<B: Backend + VisionBackend> InferenceBackend for BurnVisionNcnnBackend<B> {
             &self.inner.decoded_weights,
             &self.inner.execution_plan,
             self.inner.focus_indices.as_ref(),
+            self.inner.materialize_layout_ops,
             &self.inner.device,
             input,
         )?;
@@ -895,6 +902,7 @@ fn burn_convolution<B: Backend>(
     layer: &NcnnLayer,
     weights: &BurnLayerWeights<B>,
     swish_activation: bool,
+    prefer_elementwise_1x1: bool,
 ) -> Result<BurnTensor<B>> {
     let out_c = layer.param_usize(0).unwrap_or(0);
     let kernel_w = layer.param_usize(1).unwrap_or(1);
@@ -915,14 +923,32 @@ fn burn_convolution<B: Backend>(
         .as_ref()
         .ok_or_else(|| AmbarError::MissingNcnnWeights(layer.name.clone()))?
         .clone();
-    let options = PaddedConvOptions::asymmetric(
-        [stride_h, stride_w],
-        [pad_top, pad_left],
-        [pad_bottom, pad_right],
-        [dilation_h, dilation_w],
-        groups,
-    );
-    let mut output = conv2d(input.tensor, weight, weights.bias.clone(), options);
+    let use_elementwise_1x1 = prefer_elementwise_1x1
+        && layer.name == "Conv_47"
+        && kernel_w == 1
+        && kernel_h == 1
+        && stride_w == 1
+        && stride_h == 1
+        && dilation_w == 1
+        && dilation_h == 1
+        && pad_left == 0
+        && pad_right == 0
+        && pad_top == 0
+        && pad_bottom == 0
+        && groups == 1;
+
+    let mut output = if use_elementwise_1x1 {
+        burn_convolution_1x1_elementwise(input.tensor, weight, weights.bias.as_ref(), out_c)
+    } else {
+        let options = PaddedConvOptions::asymmetric(
+            [stride_h, stride_w],
+            [pad_top, pad_left],
+            [pad_bottom, pad_right],
+            [dilation_h, dilation_w],
+            groups,
+        );
+        conv2d(input.tensor, weight, weights.bias.clone(), options)
+    };
     if swish_activation {
         output = sigmoid(output.clone()) * output;
     } else {
@@ -939,6 +965,24 @@ fn burn_convolution<B: Backend>(
         c: out_c,
         tensor: output,
     })
+}
+
+fn burn_convolution_1x1_elementwise<B: Backend>(
+    input: Tensor<B, 4>,
+    weight: Tensor<B, 4>,
+    bias: Option<&Tensor<B, 1>>,
+    out_c: usize,
+) -> Tensor<B, 4> {
+    let mut outputs = Vec::with_capacity(out_c);
+    for out_channel in 0..out_c {
+        let weight = weight.clone().narrow(0, out_channel, 1);
+        let mut output = (input.clone() * weight).sum_dim(1);
+        if let Some(bias) = bias {
+            output = output + bias.clone().narrow(0, out_channel, 1).reshape([1, 1, 1, 1]);
+        }
+        outputs.push(output);
+    }
+    Tensor::cat(outputs, 1)
 }
 
 fn burn_apply_activation<B: Backend>(tensor: Tensor<B, 4>, activation: i32) -> Tensor<B, 4> {
@@ -1065,7 +1109,36 @@ fn burn_interp_nearest<B: Backend>(
     })
 }
 
-fn burn_reshape<B: Backend>(input: BurnTensor<B>, layer: &NcnnLayer) -> Result<BurnTensor<B>> {
+fn materialize_burn_tensor<B: Backend>(
+    input: BurnTensor<B>,
+    device: &B::Device,
+    name: &str,
+) -> Result<BurnTensor<B>> {
+    let data = input
+        .tensor
+        .into_data()
+        .into_vec::<f32>()
+        .map_err(|error| AmbarError::InvalidNcnnShape {
+            name: name.to_owned(),
+            message: error.to_string(),
+        })?;
+    Ok(BurnTensor {
+        w: input.w,
+        h: input.h,
+        c: input.c,
+        tensor: Tensor::<B, 4>::from_data(
+            TensorData::new(data, [1, input.c, input.h, input.w]),
+            device,
+        ),
+    })
+}
+
+fn burn_reshape<B: Backend>(
+    input: BurnTensor<B>,
+    layer: &NcnnLayer,
+    device: &B::Device,
+    materialize_layout_ops: bool,
+) -> Result<BurnTensor<B>> {
     let total = input.w * input.h * input.c;
     let mut w = layer.param_i32(0).unwrap_or(input.w as i32);
     let mut h = layer.param_i32(1).unwrap_or(input.h as i32);
@@ -1090,6 +1163,12 @@ fn burn_reshape<B: Backend>(input: BurnTensor<B>, layer: &NcnnLayer) -> Result<B
             message: "invalid Burn reshape".to_owned(),
         });
     }
+    let input = if materialize_layout_ops {
+        materialize_burn_tensor(input, device, &layer.name)?
+    } else {
+        input
+    };
+
     Ok(BurnTensor {
         w: w as usize,
         h: h as usize,
@@ -1100,13 +1179,48 @@ fn burn_reshape<B: Backend>(input: BurnTensor<B>, layer: &NcnnLayer) -> Result<B
     })
 }
 
-fn burn_permute<B: Backend>(input: BurnTensor<B>, layer: &NcnnLayer) -> Result<BurnTensor<B>> {
+fn burn_permute<B: Backend>(
+    input: BurnTensor<B>,
+    layer: &NcnnLayer,
+    device: &B::Device,
+    materialize_layout_ops: bool,
+) -> Result<BurnTensor<B>> {
     let order_type = layer.param_i32(0).unwrap_or(0);
     match order_type {
         1 => {
             let new_w = input.h;
             let new_h = input.w;
             let c = input.c;
+            if materialize_layout_ops {
+                let data = input
+                    .tensor
+                    .into_data()
+                    .into_vec::<f32>()
+                    .map_err(|error| AmbarError::InvalidNcnnShape {
+                        name: layer.name.clone(),
+                        message: error.to_string(),
+                    })?;
+                let mut transposed = vec![0.0; data.len()];
+                for channel in 0..c {
+                    for y in 0..input.h {
+                        for x in 0..input.w {
+                            let src = (channel * input.h + y) * input.w + x;
+                            let dst = (channel * new_h + x) * new_w + y;
+                            transposed[dst] = data[src];
+                        }
+                    }
+                }
+                return Ok(BurnTensor {
+                    w: new_w,
+                    h: new_h,
+                    c,
+                    tensor: Tensor::<B, 4>::from_data(
+                        TensorData::new(transposed, [1, c, new_h, new_w]),
+                        device,
+                    ),
+                });
+            }
+
             Ok(BurnTensor {
                 w: new_w,
                 h: new_h,
@@ -1128,6 +1242,7 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
     decoded_weights: &[Option<BurnLayerWeights<B>>],
     execution_plan: &NcnnExecutionPlan,
     focus_indices: Option<&BurnFocusIndices<B>>,
+    materialize_layout_ops: bool,
     device: &B::Device,
     input: &PreprocessedImage,
 ) -> Result<BurnTensor<B>> {
@@ -1157,13 +1272,19 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
                 )?;
             }
             "Convolution" | "ConvolutionDepthWise" => {
-                let bottom = get_burn_bottom(&blobs, layer, layer_plan, 0)?;
+                let mut bottom = get_burn_bottom(&blobs, layer, layer_plan, 0)?;
+                if materialize_layout_ops && layer.name == "Conv_47" {
+                    bottom = materialize_burn_tensor(bottom, device, &layer.name)?;
+                }
                 let weights = decoded_weights
                     .get(layer_index)
                     .and_then(Option::as_ref)
                     .ok_or_else(|| AmbarError::MissingNcnnWeights(layer.name.clone()))?;
-                if let Some(next) = fused_swish_target(&param.layers, layer_index) {
-                    let tensor = burn_convolution(bottom, layer, weights, true)?;
+                if !materialize_layout_ops
+                    && let Some(next) = fused_swish_target(&param.layers, layer_index)
+                {
+                    let tensor =
+                        burn_convolution(bottom, layer, weights, true, materialize_layout_ops)?;
                     insert_burn_single_top(
                         &mut blobs,
                         next,
@@ -1173,7 +1294,8 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
                     layer_index += 2;
                     continue;
                 }
-                let tensor = burn_convolution(bottom, layer, weights, false)?;
+                let tensor =
+                    burn_convolution(bottom, layer, weights, false, materialize_layout_ops)?;
                 insert_burn_single_top(&mut blobs, layer, layer_plan, tensor)?;
             }
             "Swish" => {
@@ -1242,7 +1364,12 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
             "Reshape" => {
                 let bottom = get_burn_bottom(&blobs, layer, layer_plan, 0)?;
                 if let Some(next) = fused_unary_target(&param.layers, layer_index, "Permute") {
-                    let tensor = burn_permute(burn_reshape(bottom, layer)?, next)?;
+                    let tensor = burn_permute(
+                        burn_reshape(bottom, layer, device, materialize_layout_ops)?,
+                        next,
+                        device,
+                        materialize_layout_ops,
+                    )?;
                     insert_burn_single_top(
                         &mut blobs,
                         next,
@@ -1256,7 +1383,7 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
                     &mut blobs,
                     layer,
                     layer_plan,
-                    burn_reshape(bottom, layer)?,
+                    burn_reshape(bottom, layer, device, materialize_layout_ops)?,
                 )?;
             }
             "Permute" => {
@@ -1265,7 +1392,7 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
                     &mut blobs,
                     layer,
                     layer_plan,
-                    burn_permute(bottom, layer)?,
+                    burn_permute(bottom, layer, device, materialize_layout_ops)?,
                 )?;
             }
             other => {

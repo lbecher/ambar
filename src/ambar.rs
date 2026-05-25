@@ -211,6 +211,7 @@ impl Ambar {
                         Default::default(),
                         config.model.input_size as usize,
                         config.max_candidates_before_nms,
+                        false,
                     )?;
                     Ok(Self::with_backend(config, backend))
                 }
@@ -223,32 +224,77 @@ impl Ambar {
                         config.model.input_size as usize,
                         &config.strides,
                         config.max_candidates_before_nms,
+                        false,
                     )?;
                     Ok(Self::with_backend(config, backend))
                 }
                 BurnDevice::Wgpu => {
-                    type B = burn::backend::Wgpu<f32>;
-                    // GPU runs the forward pass; NMS/decode runs on CPU via BurnNcnnBackend
-                    // (burn_vision NMS/top-k on Wgpu is unreliable — produces zero detections)
-                    let backend = BurnNcnnBackend::<B>::from_files(
-                        &param_path,
-                        &bin_path,
-                        Default::default(),
-                        config.model.input_size as usize,
-                        0,
-                    )?;
-                    Ok(Self::with_backend(config, backend))
+                    #[cfg(target_os = "macos")]
+                    {
+                        type B = burn::backend::wgpu::CubeBackend<
+                            burn::backend::wgpu::WgpuRuntime,
+                            f32,
+                            i32,
+                            u8,
+                        >;
+                        let device = Default::default();
+                        burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
+                            &device,
+                            Default::default(),
+                        );
+                        let backend = BurnNcnnBackend::<B>::from_files(
+                            &param_path,
+                            &bin_path,
+                            device,
+                            config.model.input_size as usize,
+                            config.max_candidates_before_nms,
+                            true,
+                        )?;
+                        Ok(Self::with_backend(config, backend))
+                    }
+
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        type B = burn::backend::wgpu::CubeBackend<
+                            burn::backend::wgpu::WgpuRuntime,
+                            f32,
+                            i32,
+                            u32,
+                        >;
+                        let device = Default::default();
+                        burn::backend::wgpu::init_setup::<
+                            burn::backend::wgpu::graphics::AutoGraphicsApi,
+                        >(&device, Default::default());
+                        let backend = BurnNcnnBackend::<B>::from_files(
+                            &param_path,
+                            &bin_path,
+                            device,
+                            config.model.input_size as usize,
+                            config.max_candidates_before_nms,
+                            true,
+                        )?;
+                        Ok(Self::with_backend(config, backend))
+                    }
                 }
                 BurnDevice::Metal => {
-                    type B = burn::backend::Metal<f32>;
-                    // GPU runs the forward pass; NMS/decode runs on CPU via BurnNcnnBackend
-                    // (burn_vision NMS/top-k on Metal is unreliable — produces zero detections)
+                    type B = burn::backend::wgpu::CubeBackend<
+                        burn::backend::wgpu::WgpuRuntime,
+                        f32,
+                        i32,
+                        u8,
+                    >;
+                    let device = Default::default();
+                    burn::backend::wgpu::init_setup::<burn::backend::wgpu::graphics::Metal>(
+                        &device,
+                        Default::default(),
+                    );
                     let backend = BurnNcnnBackend::<B>::from_files(
                         &param_path,
                         &bin_path,
-                        Default::default(),
+                        device,
                         config.model.input_size as usize,
-                        0,
+                        config.max_candidates_before_nms,
+                        true,
                     )?;
                     Ok(Self::with_backend(config, backend))
                 }
@@ -269,7 +315,8 @@ impl Ambar {
                         &bin_path,
                         device,
                         config.model.input_size as usize,
-                        0,
+                        config.max_candidates_before_nms,
+                        true,
                     )?;
                     Ok(Self::with_backend(config, backend))
                 }
@@ -291,6 +338,7 @@ impl Ambar {
                         device,
                         config.model.input_size as usize,
                         0,
+                        true,
                     )?;
                     Ok(Self::with_backend(config, backend))
                 }

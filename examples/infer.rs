@@ -111,8 +111,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(debug_layers) = cli.debug_layers.as_deref() {
         let layers = match debug_layers {
             "early" => "focus,Conv_41,Mul_43,Conv_44,Mul_46",
+            "block1" => {
+                "Conv_47,Mul_49,Conv_50,Mul_52,Conv_53,Mul_55,Conv_56,Mul_58,Conv_59,Mul_61,Conv_62,Mul_64,Add_65,Concat_66,Conv_67,Mul_69"
+            }
+            "mid1" => "Mul_69,Mul_115,Mul_161",
+            "mid2" => "Concat_193,Mul_196,Concat_218,Mul_221,Concat_243,Mul_246",
+            "mid3" => "Concat_269,Mul_272,Concat_295,Mul_298",
             "checkpoints" => {
-                "Mul_46,Mul_69,Mul_115,Mul_161,Mul_193,Mul_218,Mul_243,Mul_269,Mul_295,Concat_331,Concat_364,Concat_397,Transpose_423"
+                "Mul_46,Mul_69,Mul_115,Mul_161,Concat_193,Mul_196,Concat_218,Mul_221,Concat_243,Mul_246,Concat_269,Mul_272,Concat_295,Mul_298,Concat_331,Concat_364,Concat_397,Transpose_423"
             }
             "heads" => "Reshape_405,Reshape_413,Reshape_421,Concat_422,Transpose_423",
             layers => layers,
