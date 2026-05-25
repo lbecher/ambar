@@ -1,0 +1,16 @@
+[package]
+name = "ambar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+burn = { version = "0.21.0", features = ["ndarray", "wgpu", "metal", "fusion"] }
+burn-flex = "0.21.0"
+burn-vision = "0.21.0"
+half = "2.7.1"
+image = "0.25.10"
+memmap2 = "0.9.9"
+thiserror = "2.0.18"
+
+[dev-dependencies]
+clap = { version = "4", features = ["derive"] }
