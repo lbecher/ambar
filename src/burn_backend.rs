@@ -1272,10 +1272,7 @@ pub(crate) fn execute_burn_ncnn_model<B: Backend>(
                 )?;
             }
             "Convolution" | "ConvolutionDepthWise" => {
-                let mut bottom = get_burn_bottom(&blobs, layer, layer_plan, 0)?;
-                if materialize_layout_ops && layer.name == "Conv_47" {
-                    bottom = materialize_burn_tensor(bottom, device, &layer.name)?;
-                }
+                let bottom = get_burn_bottom(&blobs, layer, layer_plan, 0)?;
                 let weights = decoded_weights
                     .get(layer_index)
                     .and_then(Option::as_ref)
